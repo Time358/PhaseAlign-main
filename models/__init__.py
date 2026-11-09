@@ -1,1 +1,1 @@
-from .PhaseAlign import Model as PhaseAlignModel
+from .PhaseAlign import PhaseAlign

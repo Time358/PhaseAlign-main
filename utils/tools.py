@@ -1,133 +1,71 @@
-import numpy as np
+import os
+
 import torch
 from tqdm import tqdm
 
-# run_main 通过设置此全局变量来统一控制验证/测试进度条
-VALI_SHOW_PROGRESS = True
-# 精简进度条格式（去掉 ETA/速度，控制条宽，降低刷新频率）
-SHORT_BAR_FORMAT = '{l_bar}{bar:10}{percentage:3.0f}% {n_fmt}/{total_fmt}'
-SHORT_BAR_KWARGS = dict(ncols=40, bar_format=SHORT_BAR_FORMAT, mininterval=1.0, leave=False)
-
-
-def adjust_learning_rate(accelerator, optimizer, scheduler, epoch, args, printout=True):
-    if args.lradj == 'type1':
-        lr_adjust = {epoch: args.learning_rate * (0.5 ** ((epoch - 1) // 1))}
-    elif args.lradj == 'type2':
-        lr_adjust = {
-            2: 5e-5, 4: 1e-5, 6: 5e-6, 8: 1e-6,
-            10: 5e-7, 15: 1e-7, 20: 5e-8
-        }
-    elif args.lradj == 'type3':
-        lr_adjust = {epoch: args.learning_rate if epoch < 3 else args.learning_rate * (0.9 ** ((epoch - 3) // 1))}
-    elif args.lradj == 'PEMS':
-        lr_adjust = {epoch: args.learning_rate * (0.95 ** (epoch // 1))}
-    elif args.lradj == 'TST':
-        lr_adjust = {epoch: scheduler.get_last_lr()[0]}
-    elif args.lradj == 'constant':
-        lr_adjust = {epoch: args.learning_rate}
-    if epoch in lr_adjust.keys():
-        lr = lr_adjust[epoch]
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
-        if printout:
-            if accelerator is not None:
-                accelerator.print('Updating learning rate to {}'.format(lr))
-            else:
-                print('Updating learning rate to {}'.format(lr))
+PROGRESS_KWARGS = dict(ncols=40, bar_format='{l_bar}{bar:10}{percentage:3.0f}% {n_fmt}/{total_fmt}',
+                       mininterval=1.0, leave=False)
 
 
 class EarlyStopping:
-    def __init__(self, accelerator=None, patience=7, verbose=False, delta=0, save_mode=True):
+    def __init__(self, accelerator=None, patience=7):
         self.accelerator = accelerator
         self.patience = patience
-        self.verbose = verbose
         self.counter = 0
         self.best_score = None
+        self.best_epoch = None
         self.early_stop = False
-        self.val_loss_min = np.inf
-        self.delta = delta
-        self.save_mode = save_mode
 
-    def __call__(self, val_loss, model, path):
+    def __call__(self, val_loss, model, path, epoch=None):
         score = -val_loss
-        if self.best_score is None:
+        if self.best_score is None or score > self.best_score:
             self.best_score = score
-            if self.save_mode:
-                self.save_checkpoint(val_loss, model, path)
-        elif score < self.best_score + self.delta:
-            self.counter += 1
-            if self.accelerator is None:
-                print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
-            else:
-                self.accelerator.print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
-            if self.counter >= self.patience:
-                self.early_stop = True
-        else:
-            self.best_score = score
-            if self.save_mode:
-                self.save_checkpoint(val_loss, model, path)
+            self.best_epoch = epoch
             self.counter = 0
+            self.save_checkpoint(model, path)
+            return
+        self.counter += 1
+        if self.counter >= self.patience:
+            self.early_stop = True
 
-    def save_checkpoint(self, val_loss, model, path):
-        if self.verbose:
-            if self.accelerator is not None:
-                self.accelerator.print(
-                    f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ...')
-            else:
-                print(
-                    f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ...')
-
+    def save_checkpoint(self, model, path):
         if self.accelerator is not None:
+            if not self.accelerator.is_main_process:
+                return
             model = self.accelerator.unwrap_model(model)
-            torch.save(model.state_dict(), path + '/' + 'checkpoint')
-        else:
-            torch.save(model.state_dict(), path + '/' + 'checkpoint')
-        self.val_loss_min = val_loss
+        torch.save(model.state_dict(), os.path.join(path, 'checkpoint'))
 
 
-def vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric):
-    total_loss = []
-    total_mae_loss = []
+def vali(args, accelerator, model, vali_loader, criterion, mae_metric, show=False):
     model.eval()
+    mse_sum = 0.0
+    mae_sum = 0.0
+    n_samples = 0
+    f_dim = -1 if args.features == 'MS' else 0
+    show = show and (accelerator is None or accelerator.is_main_process)
     with torch.no_grad():
-        for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in tqdm(
-                enumerate(vali_loader), disable=not VALI_SHOW_PROGRESS, **SHORT_BAR_KWARGS):
+        for batch_x, batch_y, batch_x_mark, batch_y_mark in tqdm(
+                vali_loader, disable=not show, **PROGRESS_KWARGS):
             batch_x = batch_x.float().to(accelerator.device)
             batch_y = batch_y.float().to(accelerator.device)
-
             batch_x_mark = batch_x_mark.float().to(accelerator.device)
             batch_y_mark = batch_y_mark.float().to(accelerator.device)
 
-            dec_inp = torch.zeros_like(batch_y[:, -args.pred_len:, :]).float().to(accelerator.device)
-            dec_inp = torch.cat([batch_y[:, :args.label_len, :], dec_inp], dim=1).float()
+            outputs = model(batch_x, batch_x_mark, None, batch_y_mark)
 
-            if args.use_amp:
-                with torch.cuda.amp.autocast():
-                    if args.output_attention:
-                        outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                    else:
-                        outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-            else:
-                if args.output_attention:
-                    outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                else:
-                    outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-
-            f_dim = -1 if args.features == 'MS' else 0
             outputs = outputs[:, -args.pred_len:, f_dim:]
             batch_y = batch_y[:, -args.pred_len:, f_dim:]
+            if outputs.shape != batch_y.shape:
+                raise RuntimeError(f'prediction shape {tuple(outputs.shape)} != '
+                                   f'target shape {tuple(batch_y.shape)}')
 
-            pred = accelerator.gather_for_metrics(outputs.detach())
-            true = accelerator.gather_for_metrics(batch_y.detach())
-            total_loss.append(criterion(pred, true).item())
-            total_mae_loss.append(mae_metric(pred, true).item())
-
-    if len(total_loss) == 0:
-        total_loss = np.nan
-        total_mae_loss = np.nan
-    else:
-        total_loss = np.average(total_loss)
-        total_mae_loss = np.average(total_mae_loss)
+            pred, true = accelerator.gather_for_metrics((outputs, batch_y))
+            n = true.shape[0]
+            mse_sum += criterion(pred, true).item() * n
+            mae_sum += mae_metric(pred, true).item() * n
+            n_samples += n
 
     model.train()
-    return total_loss, total_mae_loss
+    if n_samples == 0:
+        raise RuntimeError('empty validation loader')
+    return mse_sum / n_samples, mae_sum / n_samples
